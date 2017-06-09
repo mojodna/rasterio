@@ -31,6 +31,7 @@ from rasterio.vfs import parse_path, vsi_path
 from rasterio import windows
 
 from libc.stdio cimport FILE
+from libc.math cimport ceil
 cimport numpy as np
 
 from rasterio._base cimport _osr_from_crs, get_driver_name, DatasetBase
@@ -160,8 +161,10 @@ cdef class DatasetReaderBase(DatasetBase):
         elif isinstance(indexes, int):
             indexes = [indexes]
             return2d = True
+
             if out is not None and out.ndim == 2:
                 out.shape = (1,) + out.shape
+
         if not indexes:
             raise ValueError("No indexes to read")
 
@@ -214,18 +217,31 @@ cdef class DatasetReaderBase(DatasetBase):
             dtype = check_dtypes.pop()
 
         # Get the natural shape of the read window, boundless or not.
+        # The window can have float values. In this case, we round up
+        # when computing the shape.
+
+        # Stub the win_shape.
         win_shape = (len(indexes),)
+
         if window:
+
             if boundless:
                 win_shape += (
-                        window[0][1]-window[0][0], window[1][1]-window[1][0])
+                    int(round(window[0][1] - window[0][0], 6)),
+                    int(round(window[1][1] - window[1][0], 6)))
+
             else:
                 window = windows.crop(
                     windows.evaluate(window, self.height, self.width),
-                    self.height, self.width
-                )
+                    self.height, self.width)
                 (r_start, r_stop), (c_start, c_stop) = window
-                win_shape += (r_stop - r_start, c_stop - c_start)
+
+                log.debug("Cropped window: %r", window)
+
+                win_shape += (
+                    int(round(r_stop - r_start, 6)),
+                    int(round(c_stop - c_start, 6)))
+
         else:
             win_shape += self.shape
 
@@ -255,9 +271,9 @@ cdef class DatasetReaderBase(DatasetBase):
             # bounded case.
 
             if boundless:
-                out = np.zeros(out_shape, dtype=dtype)
+                out = np.zeros(tuple(int(round(x)) for x in out_shape), dtype=dtype)
             else:
-                out = np.empty(out_shape, dtype=dtype)
+                out = np.empty(tuple(int(round(x)) for x in out_shape), dtype=dtype)
 
             for i, (ndv, arr) in enumerate(zip(
                     nodatavals, out if len(out.shape) == 3 else [out])):
@@ -284,6 +300,10 @@ cdef class DatasetReaderBase(DatasetBase):
         # We can jump straight to _read() in some cases. We can ignore
         # the boundless flag if there's no given window.
         if not boundless or not window:
+
+            log.debug("Jump straight to _read()")
+            log.debug("Window: %r", window)
+
             out = self._read(indexes, out, window, dtype,
                              resampling=resampling)
 
@@ -311,6 +331,8 @@ cdef class DatasetReaderBase(DatasetBase):
                 max(min(window[0][1], self.height), 0)), (
                 max(min(window[1][0], self.width), 0),
                 max(min(window[1][1], self.width), 0)))
+
+            log.debug("Overlap: %r", overlap)
 
             if overlap != ((0, 0), (0, 0)):
                 # Prepare a buffer.
@@ -546,19 +568,28 @@ cdef class DatasetReaderBase(DatasetBase):
         `out` (if used), or will be masked if any of the nodatavals are
         not `None`.
         """
-        cdef int height, width, xoff, yoff, aix, bidx, indexes_count
+        cdef int aix, bidx, indexes_count
+        cdef double height, width, xoff, yoff
         cdef int retval = 0
         cdef GDALDatasetH dataset = NULL
 
+        if out is None:
+            raise ValueError("An output array is required.")
+
         dataset = self.handle()
 
-        # Prepare the IO window.
+        # Turning the read window into GDAL offsets and lengths is
+        # the job of _read().
         if window:
             window = windows.evaluate(window, self.height, self.width)
-            yoff = <int>window[0][0]
-            xoff = <int>window[1][0]
-            height = <int>window[0][1] - yoff
-            width = <int>window[1][1] - xoff
+
+            log.debug("Eval'd window: %r", window)
+
+            yoff = window[0][0]
+            xoff = window[1][0]
+            height = window[0][1] - yoff
+            width = window[1][1] - xoff
+
         else:
             xoff = yoff = <int>0
             width = <int>self.width
